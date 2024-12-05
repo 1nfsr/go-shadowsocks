@@ -5,12 +5,13 @@ import (
 	"os"
 )
 
+// Config defines the server configuration structure
 type Config struct {
-	Server     string `json:"server"`
-	ServerPort int    `json:"server_port"`
-	Method     string `json:"method"`
-	Password   string `json:"password"`
-	LogLevel   string `json:"log_level"`
+	Server     string `json:"server"`      // Server address
+	ServerPort int    `json:"server_port"` // Server port
+	Method     string `json:"method"`      // Encryption method
+	Password   string `json:"password"`    // Password
+	LogLevel   string `json:"log_level"`   // Log level
 }
 
 func Load(path string) (*Config, error) {

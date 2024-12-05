@@ -14,15 +14,17 @@ import (
 	"crypto/aes"
 )
 
+// Cipher interface defines basic encryption operations
 type Cipher interface {
 	StreamConn(net.Conn) net.Conn
 	GetMethod() string
 }
 
+// aeadCipher implements AEAD encryption
 type aeadCipher struct {
-	psk      []byte
-	makeAEAD func(key []byte) (cipher.AEAD, error)
-	method   string
+	psk      []byte                                // Pre-shared key
+	makeAEAD func(key []byte) (cipher.AEAD, error) // AEAD constructor
+	method   string                                // Encryption method name
 }
 
 func (aead *aeadCipher) StreamConn(c net.Conn) net.Conn {
@@ -34,9 +36,9 @@ func (aead *aeadCipher) GetMethod() string {
 }
 
 const (
-	MaxPayloadSize = 16384
-	SaltSize      = 32
-	SubKeyInfo    = "ss-subkey"
+	MaxPayloadSize = 16384 // Maximum payload size
+	SaltSize      = 32    // Salt size
+	SubKeyInfo    = "ss-subkey" // Subkey info
 )
 
 var SupportedCiphers = map[string]struct{}{
@@ -46,11 +48,13 @@ var SupportedCiphers = map[string]struct{}{
 	"aes-256-gcm":           {},
 }
 
+// NewCipher creates a new encryption instance
 func NewCipher(method, password string) (Cipher, error) {
 	if _, ok := SupportedCiphers[method]; !ok {
 		return nil, fmt.Errorf("unsupported method: %s", method)
 	}
 
+	// Select key size based on the encryption method
 	var keySize int
 	switch method {
 	case "chacha20-ietf-poly1305":
@@ -66,6 +70,7 @@ func NewCipher(method, password string) (Cipher, error) {
 	key := kdf(password, keySize)
 	var makeAEAD func([]byte) (cipher.AEAD, error)
 	
+	// Select the appropriate AEAD constructor
 	if method == "chacha20-ietf-poly1305" {
 		makeAEAD = chacha20poly1305.New
 	} else {
@@ -79,6 +84,7 @@ func NewCipher(method, password string) (Cipher, error) {
 	}, nil
 }
 
+// aesGCM returns a function to create an AES-GCM AEAD instance
 func aesGCM(keySize int) func(key []byte) (cipher.AEAD, error) {
 	return func(key []byte) (cipher.AEAD, error) {
 		block, err := aes.NewCipher(key)
@@ -186,28 +192,28 @@ func (c *streamConn) Write(b []byte) (n int, err error) {
 }
 
 func (r *reader) Read(b []byte) (n int, err error) {
-	// 使用缓存的数据
+	// Use cached data
 	if n = r.readBuf(b); n > 0 {
 		return
 	}
 
-	// 读取并解密大小
+	// Read and decrypt size
 	size, err := r.readSize()
 	if err != nil {
 		return 0, err
 	}
 
-	// 读取并解密负载
+	// Read and decrypt payload
 	payload, err := r.readPayload(size)
 	if err != nil {
 		return 0, err
 	}
 
-	// 复制数据到输出缓冲区
+	// Copy data to output buffer
 	return r.copyPayload(b, payload), nil
 }
 
-// 添加辅助方法
+// Add helper methods
 func (r *reader) readBuf(b []byte) int {
 	if r.buf != nil && r.offset < len(r.buf) {
 		n := copy(b, r.buf[r.offset:])

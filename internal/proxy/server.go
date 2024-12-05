@@ -14,16 +14,15 @@ import (
 	"github.com/1nfsr/go-shadowsocks/pkg/logger"
 )
 
+// Server defines the proxy server
 type Server struct {
-	config   *config.Config
-	cipher   cipher.Cipher
-	listener net.Listener
-	logger   *logger.Logger
+	config   *config.Config  // Server configuration
+	cipher   cipher.Cipher   // Encryption handler
+	listener net.Listener    // Network listener
+	logger   *logger.Logger  // Logger instance
 	
-	// 连接池
-	connPool sync.Pool
-	// 优雅关闭
-	done     chan struct{}
+	connPool sync.Pool       // Connection pool
+	done     chan struct{}   // Graceful shutdown signal
 }
 
 func NewServer(config *config.Config) (*Server, error) {

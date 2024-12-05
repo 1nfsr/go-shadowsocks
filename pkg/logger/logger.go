@@ -5,9 +5,10 @@ import (
 	"os"
 )
 
+// Logger provides logging functionality
 type Logger struct {
-	logger *log.Logger
-	debug  bool
+	logger *log.Logger  // Underlying logger
+	debug  bool         // Debug mode enabled
 }
 
 func New(debug bool) *Logger {
