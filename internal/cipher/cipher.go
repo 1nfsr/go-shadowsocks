@@ -11,6 +11,7 @@ import (
 	
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
+	"crypto/aes"
 )
 
 type Cipher interface {
@@ -32,17 +33,60 @@ func (aead *aeadCipher) GetMethod() string {
 	return aead.method
 }
 
+const (
+	MaxPayloadSize = 16384
+	SaltSize      = 32
+	SubKeyInfo    = "ss-subkey"
+)
+
+var SupportedCiphers = map[string]struct{}{
+	"chacha20-ietf-poly1305": {},
+	"aes-128-gcm":           {},
+	"aes-192-gcm":           {},
+	"aes-256-gcm":           {},
+}
+
 func NewCipher(method, password string) (Cipher, error) {
-	if method != "chacha20-ietf-poly1305" {
+	if _, ok := SupportedCiphers[method]; !ok {
 		return nil, fmt.Errorf("unsupported method: %s", method)
 	}
 
-	key := kdf(password, chacha20poly1305.KeySize)
+	var keySize int
+	switch method {
+	case "chacha20-ietf-poly1305":
+		keySize = chacha20poly1305.KeySize
+	case "aes-128-gcm":
+		keySize = 16
+	case "aes-192-gcm":
+		keySize = 24
+	case "aes-256-gcm":
+		keySize = 32
+	}
+
+	key := kdf(password, keySize)
+	var makeAEAD func([]byte) (cipher.AEAD, error)
+	
+	if method == "chacha20-ietf-poly1305" {
+		makeAEAD = chacha20poly1305.New
+	} else {
+		makeAEAD = aesGCM(keySize)
+	}
+
 	return &aeadCipher{
 		psk:      key,
-		makeAEAD: chacha20poly1305.New,
+		makeAEAD: makeAEAD,
 		method:   method,
 	}, nil
+}
+
+func aesGCM(keySize int) func(key []byte) (cipher.AEAD, error) {
+	return func(key []byte) (cipher.AEAD, error) {
+		block, err := aes.NewCipher(key)
+		if err != nil {
+			return nil, err
+		}
+		return cipher.NewGCM(block)
+	}
 }
 
 type streamConn struct {
@@ -88,24 +132,31 @@ func newStreamConn(conn net.Conn, cipher *aeadCipher) net.Conn {
 
 func (c *streamConn) Read(b []byte) (n int, err error) {
 	if c.reader.aead == nil {
-		// Read salt
-		salt := make([]byte, 32)
-		if _, err := io.ReadFull(c.Conn, salt); err != nil {
-			return 0, err
-		}
-
-		// Derive subkey
-		subkey := make([]byte, len(c.cipher.psk))
-		hkdfSHA1(c.cipher.psk, salt, []byte("ss-subkey"), subkey)
-
-		aead, err := c.cipher.makeAEAD(subkey)
+		err := c.initReader()
 		if err != nil {
 			return 0, err
 		}
-
-		c.reader.aead = aead
 	}
 	return c.reader.Read(b)
+}
+
+func (c *streamConn) initReader() error {
+	salt := make([]byte, SaltSize)
+	if _, err := io.ReadFull(c.Conn, salt); err != nil {
+		return fmt.Errorf("failed to read salt: %v", err)
+	}
+
+	subkey := make([]byte, len(c.cipher.psk))
+	hkdfSHA1(c.cipher.psk, salt, []byte(SubKeyInfo), subkey)
+
+	aead, err := c.cipher.makeAEAD(subkey)
+	if err != nil {
+		return fmt.Errorf("failed to create AEAD: %v", err)
+	}
+
+	c.reader.aead = aead
+	c.reader.nonce = make([]byte, aead.NonceSize())
+	return nil
 }
 
 func (c *streamConn) Write(b []byte) (n int, err error) {
@@ -135,23 +186,47 @@ func (c *streamConn) Write(b []byte) (n int, err error) {
 }
 
 func (r *reader) Read(b []byte) (n int, err error) {
+	// 使用缓存的数据
+	if n = r.readBuf(b); n > 0 {
+		return
+	}
+
+	// 读取并解密大小
+	size, err := r.readSize()
+	if err != nil {
+		return 0, err
+	}
+
+	// 读取并解密负载
+	payload, err := r.readPayload(size)
+	if err != nil {
+		return 0, err
+	}
+
+	// 复制数据到输出缓冲区
+	return r.copyPayload(b, payload), nil
+}
+
+// 添加辅助方法
+func (r *reader) readBuf(b []byte) int {
 	if r.buf != nil && r.offset < len(r.buf) {
-		n = copy(b, r.buf[r.offset:])
+		n := copy(b, r.buf[r.offset:])
 		r.offset += n
 		if r.offset >= len(r.buf) {
 			r.buf = nil
 			r.offset = 0
 		}
-		return n, nil
+		return n
 	}
+	return 0
+}
 
-	// Read encrypted size
+func (r *reader) readSize() (int, error) {
 	sizeBuf := make([]byte, 2+r.aead.Overhead())
 	if _, err := io.ReadFull(r.conn, sizeBuf); err != nil {
 		return 0, err
 	}
 
-	// Decrypt size
 	size, err := r.aead.Open(nil, r.nonce, sizeBuf, nil)
 	if err != nil {
 		return 0, fmt.Errorf("failed to decrypt size: %v", err)
@@ -159,29 +234,34 @@ func (r *reader) Read(b []byte) (n int, err error) {
 	incrementNonce(r.nonce)
 
 	length := int(size[0])<<8 | int(size[1])
-	if length <= 0 || length > 16384 {
+	if length <= 0 || length > MaxPayloadSize {
 		return 0, fmt.Errorf("invalid payload size: %d", length)
 	}
+	return length, nil
+}
 
-	// Read encrypted payload
-	payload := make([]byte, length+r.aead.Overhead())
+func (r *reader) readPayload(size int) ([]byte, error) {
+	payload := make([]byte, size+r.aead.Overhead())
 	if _, err := io.ReadFull(r.conn, payload); err != nil {
-		return 0, err
+		return nil, err
 	}
 
-	// Decrypt payload
-	payload, err = r.aead.Open(nil, r.nonce, payload, nil)
+	payload, err := r.aead.Open(nil, r.nonce, payload, nil)
 	if err != nil {
-		return 0, fmt.Errorf("failed to decrypt payload: %v", err)
+		return nil, fmt.Errorf("failed to decrypt payload: %v", err)
 	}
 	incrementNonce(r.nonce)
 
-	n = copy(b, payload)
+	return payload, nil
+}
+
+func (r *reader) copyPayload(dst []byte, payload []byte) int {
+	n := copy(dst, payload)
 	if n < len(payload) {
 		r.buf = payload
 		r.offset = n
 	}
-	return n, nil
+	return n
 }
 
 func (w *writer) Write(b []byte) (n int, err error) {
