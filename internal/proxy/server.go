@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -68,16 +69,15 @@ func (s *Server) handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr().String()
 	log.Printf("New connection from: %s", remoteAddr)
 	
-	log.Printf("Debug: Cipher method=%s", s.cipher.GetMethod())
-	
-	// Try to get StreamConn interface
+	// Create encrypted connection
 	sconn := s.cipher.StreamConn(conn)
 	defer sconn.Close()
 	
 	// Read target address
-	buf := make([]byte, 259)
-	_, err := io.ReadFull(sconn, buf[:1]) // read atyp
-	if err != nil {
+	buf := make([]byte, 259) // Max length: 1(atyp) + 1(len) + 255(domain) + 2(port)
+	
+	// Read address type
+	if _, err := io.ReadFull(sconn, buf[:1]); err != nil {
 		log.Printf("Failed to read address type: %v", err)
 		return
 	}
@@ -88,32 +88,44 @@ func (s *Server) handleConnection(conn net.Conn) {
 	
 	switch atyp {
 	case 0x01: // IPv4
-		_, err = io.ReadFull(sconn, buf[1:7])
-		if err != nil {
+		if _, err := io.ReadFull(sconn, buf[1:7]); err != nil {
 			log.Printf("Failed to read IPv4 address: %v", err)
 			return
 		}
-		targetAddr = fmt.Sprintf("%d.%d.%d.%d:%d",
-			buf[1], buf[2], buf[3], buf[4],
-			uint16(buf[5])<<8|uint16(buf[6]))
 		domain = fmt.Sprintf("%d.%d.%d.%d", buf[1], buf[2], buf[3], buf[4])
+		port := binary.BigEndian.Uint16(buf[5:7])
+		targetAddr = fmt.Sprintf("%s:%d", domain, port)
 		
 	case 0x03: // Domain name
-		_, err = io.ReadFull(sconn, buf[1:2]) // read domain length
-		if err != nil {
+		if _, err := io.ReadFull(sconn, buf[1:2]); err != nil {
 			log.Printf("Failed to read domain length: %v", err)
 			return
 		}
+		
 		domainLen := int(buf[1])
-		_, err = io.ReadFull(sconn, buf[2:2+domainLen+2])
-		if err != nil {
+		log.Printf("Debug: Domain length received: %d", domainLen)
+		if domainLen == 0 || domainLen > 255 {
+			log.Printf("Invalid domain length: %d", domainLen)
+			return
+		}
+		
+		if _, err := io.ReadFull(sconn, buf[2:2+domainLen+2]); err != nil {
 			log.Printf("Failed to read domain and port: %v", err)
 			return
 		}
+		
 		domain = string(buf[2 : 2+domainLen])
-		targetAddr = fmt.Sprintf("%s:%d",
-			domain,
-			uint16(buf[2+domainLen])<<8|uint16(buf[2+domainLen+1]))
+		port := binary.BigEndian.Uint16(buf[2+domainLen : 2+domainLen+2])
+		targetAddr = fmt.Sprintf("%s:%d", domain, port)
+		
+	default:
+		log.Printf("Unsupported address type: %#x", atyp)
+		return
+	}
+	
+	if domain == "" || targetAddr == "" {
+		log.Printf("Invalid target address")
+		return
 	}
 	
 	log.Printf("Client %s is visiting: %s", remoteAddr, domain)
@@ -126,32 +138,26 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 	defer target.Close()
 	
-	// Start proxying with traffic monitoring
+	// Start proxying
 	done := make(chan error, 2)
 	
 	// Client to target
 	go func() {
-		written, err := io.Copy(target, sconn)
-		if err != nil && !isClosedConnError(err) {
-			log.Printf("Error copying to target %s: %v", domain, err)
-		}
-		log.Printf("Client %s uploaded %d bytes to %s", remoteAddr, written, domain)
+		_, err := io.Copy(target, sconn)
 		done <- err
 	}()
 	
 	// Target to client
 	go func() {
-		written, err := io.Copy(sconn, target)
-		if err != nil && !isClosedConnError(err) {
-			log.Printf("Error copying from target %s: %v", domain, err)
-		}
-		log.Printf("Client %s downloaded %d bytes from %s", remoteAddr, written, domain)
+		_, err := io.Copy(sconn, target)
 		done <- err
 	}()
 	
 	// Wait for either direction to finish
-	<-done
-	return
+	err = <-done
+	if err != nil && !isClosedConnError(err) {
+		log.Printf("Connection error: %v", err)
+	}
 }
 
 func isClosedConnError(err error) bool {
